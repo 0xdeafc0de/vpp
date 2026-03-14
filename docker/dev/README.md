@@ -11,6 +11,11 @@ The setup is meant for daily iteration:
 - VPP can be started with either the default container config or a custom
   startup config from the repo
 
+The helper script supports both:
+
+- `docker compose`
+- `docker-compose`
+
 ## What gets created
 
 - [Dockerfile.dev](/Users/sspingal/ws/yuvo/vpp/Dockerfile.dev): development image
@@ -19,6 +24,9 @@ The setup is meant for daily iteration:
 - [startup.conf](/Users/sspingal/ws/yuvo/vpp/docker/dev/startup.conf): default startup config for container runs
 
 ## First-time setup
+
+Make sure your machine has either the Docker Compose plugin or the legacy
+`docker-compose` binary installed.
 
 From the VPP repo root:
 
