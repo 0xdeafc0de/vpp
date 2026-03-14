@@ -48,15 +48,15 @@ stores the result in buffer metadata (`opaque2`) as:
 
 The plugin source lives in:
 
-- [subscriber_dp.c](/Users/sspingal/ws/yuvo/vpp/src/plugins/subscriber_dp/subscriber_dp.c)
-- [subscriber_dp_node.c](/Users/sspingal/ws/yuvo/vpp/src/plugins/subscriber_dp/subscriber_dp_node.c)
-- [subscriber_dp_api.c](/Users/sspingal/ws/yuvo/vpp/src/plugins/subscriber_dp/subscriber_dp_api.c)
-- [subscriber_dp.api](/Users/sspingal/ws/yuvo/vpp/src/plugins/subscriber_dp/subscriber_dp.api)
+- [subscriber_dp.c](/Users/sspingal/ws/vpp/src/plugins/subscriber_dp/subscriber_dp.c)
+- [subscriber_dp_node.c](/Users/sspingal/ws/vpp/src/plugins/subscriber_dp/subscriber_dp_node.c)
+- [subscriber_dp_api.c](/Users/sspingal/ws/vpp/src/plugins/subscriber_dp/subscriber_dp_api.c)
+- [subscriber_dp.api](/Users/sspingal/ws/vpp/src/plugins/subscriber_dp/subscriber_dp.api)
 
 Build it with the normal VPP build:
 
 ```bash
-cd /Users/sspingal/ws/yuvo/vpp
+cd /Users/sspingal/ws/vpp
 docker/dev/vpp-dev build-release
 ```
 
@@ -67,7 +67,7 @@ subscriber_dp_plugin.so
 ```
 
 Important: this plugin is marked `default_disabled = 1` in
-[plugin.c](/Users/sspingal/ws/yuvo/vpp/src/plugins/subscriber_dp/plugin.c), so
+[plugin.c](/Users/sspingal/ws/vpp/src/plugins/subscriber_dp/plugin.c), so
 you must explicitly enable it in `startup.conf`:
 
 ```conf
@@ -152,7 +152,7 @@ This displays:
 ## Binary APIs
 
 The plugin also exposes binary APIs defined in
-[subscriber_dp.api](/Users/sspingal/ws/yuvo/vpp/src/plugins/subscriber_dp/subscriber_dp.api):
+[subscriber_dp.api](/Users/sspingal/ws/vpp/src/plugins/subscriber_dp/subscriber_dp.api):
 
 - `subscriber_dp_enable_disable`
 - `subscriber_dp_subscriber_add`

@@ -11,19 +11,50 @@ The setup is meant for daily iteration:
 - VPP can be started with either the default container config or a custom
   startup config from the repo
 
+The helper script supports both:
+
+- `docker compose`
+- `docker-compose`
+
 ## What gets created
 
-- [Dockerfile.dev](/Users/sspingal/ws/yuvo/vpp/Dockerfile.dev): development image
-- [compose.dev.yaml](/Users/sspingal/ws/yuvo/vpp/compose.dev.yaml): long-running dev container
-- [vpp-dev](/Users/sspingal/ws/yuvo/vpp/docker/dev/vpp-dev): helper wrapper around `docker compose`
-- [startup.conf](/Users/sspingal/ws/yuvo/vpp/docker/dev/startup.conf): default startup config for container runs
+- [Dockerfile.dev](/Users/sspingal/ws/vpp/Dockerfile.dev): development image
+- [compose.dev.yaml](/Users/sspingal/ws/vpp/compose.dev.yaml): long-running dev container
+- [vpp-dev](/Users/sspingal/ws/vpp/docker/dev/vpp-dev): helper wrapper around `docker compose`
+- [startup.conf](/Users/sspingal/ws/vpp/docker/dev/startup.conf): default startup config for container runs
 
 ## First-time setup
+
+Make sure your machine has either the Docker Compose plugin or the legacy
+`docker-compose` binary installed.
+
+### Ubuntu 22.04 quick start
+
+On Ubuntu 22.04, a simple setup is:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y docker.io docker-compose
+sudo systemctl enable --now docker
+sudo usermod -aG docker "$USER"
+```
+
+After adding your user to the `docker` group, log out and log back in before
+running Docker commands without `sudo`.
+
+Depending on your installation, either of these may be available:
+
+```bash
+docker compose version
+docker-compose version
+```
+
+The helper script supports both forms.
 
 From the VPP repo root:
 
 ```bash
-cd /Users/sspingal/ws/yuvo/vpp
+cd /Users/sspingal/ws/vpp
 docker/dev/vpp-dev up
 ```
 
@@ -86,8 +117,8 @@ docker/dev/vpp-dev run-debug /workspace/vpp/startup_configs/no_dpdk2.conf
 
 Edit files on the host normally, for example:
 
-- plugin code under `/Users/sspingal/ws/yuvo/vpp/src/plugins/...`
-- startup configs under `/Users/sspingal/ws/yuvo/vpp/startup_configs/...`
+- plugin code under `/Users/sspingal/ws/vpp/src/plugins/...`
+- startup configs under `/Users/sspingal/ws/vpp/startup_configs/...`
 
 Because the repo is bind-mounted, the container sees those changes immediately.
 
@@ -197,6 +228,6 @@ plugins {
   passes it through.
 - The repo's checked-in `build-root` stays visible; only generated outputs are
   redirected to `/cache/vpp-build-root` through `MAKEFLAGS=BR=/cache/vpp-build-root`.
-- The default [startup.conf](/Users/sspingal/ws/yuvo/vpp/docker/dev/startup.conf)
+- The default [startup.conf](/Users/sspingal/ws/vpp/docker/dev/startup.conf)
   is only a minimal dev convenience config. Real dataplane experiments should
-  use a dedicated startup file under `/Users/sspingal/ws/yuvo/vpp/startup_configs`.
+  use a dedicated startup file under `/Users/sspingal/ws/vpp/startup_configs`.
