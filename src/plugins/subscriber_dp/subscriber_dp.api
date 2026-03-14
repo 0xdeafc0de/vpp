@@ -1,0 +1,58 @@
+option version = "0.1.0";
+
+import "vnet/interface_types.api";
+
+autoreply define subscriber_dp_enable_disable
+{
+  u32 client_index;
+  u32 context;
+  vl_api_interface_index_t sw_if_index;
+  bool is_ip6 [default=false];
+  bool enable [default=true];
+
+  option vat_help = "subscriber_dp_enable_disable <intfc> [ip6] [disable]";
+};
+
+autoreply define subscriber_dp_subscriber_add
+{
+  u32 client_index;
+  u32 context;
+  vl_api_interface_index_t sw_if_index;
+  u64 subscriber_id;
+  bool is_ip6 [default=false];
+  u8 address[16];
+};
+
+autoreply define subscriber_dp_subscriber_del
+{
+  u32 client_index;
+  u32 context;
+  vl_api_interface_index_t sw_if_index;
+  bool is_ip6 [default=false];
+  u8 address[16];
+};
+
+autoreply define subscriber_dp_subscriber_update
+{
+  u32 client_index;
+  u32 context;
+  vl_api_interface_index_t sw_if_index;
+  u64 subscriber_id;
+  bool is_ip6 [default=false];
+  u8 address[16];
+};
+
+define subscriber_dp_subscriber_dump
+{
+  u32 client_index;
+  u32 context;
+};
+
+define subscriber_dp_subscriber_details
+{
+  u32 context;
+  vl_api_interface_index_t sw_if_index;
+  u64 subscriber_id;
+  bool is_ip6;
+  u8 address[16];
+};
