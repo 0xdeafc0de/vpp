@@ -1,0 +1,51 @@
+FROM ubuntu:24.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG VPP_GIT_TAG_FALLBACK=v25.02
+ARG VPP_GIT_DESCRIBE_FALLBACK=v25.02-0-gcontainer
+
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+ENV UNATTENDED=y
+ENV CCACHE_DIR=/root/.cache/ccache
+ENV CCACHE_COMPRESS=1
+ENV CCACHE_MAXSIZE=10G
+
+WORKDIR /tmp/vpp-src
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    ccache \
+    curl \
+    git \
+    make \
+    sudo \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY . /tmp/vpp-src
+COPY docker/dev/entrypoint.sh /usr/local/bin/vpp-dev-entrypoint
+
+RUN mkdir -p /tmp/vpp-src/build-root \
+ && printf 'SOURCE_PATH = /tmp/vpp-src\n' > /tmp/vpp-src/build-root/build-config.mk \
+ && if git -C /tmp/vpp-src describe --long --match 'v*' > /tmp/vpp-version 2>/dev/null; then \
+      cp /tmp/vpp-version /tmp/vpp-src/src/.version; \
+    else \
+      printf '%s\n' "$VPP_GIT_DESCRIBE_FALLBACK" > /tmp/vpp-src/src/.version; \
+      rm -rf /tmp/vpp-src/.git; \
+      git -C /tmp/vpp-src init; \
+      git -C /tmp/vpp-src add -A; \
+      git -C /tmp/vpp-src \
+        -c user.name='Docker Build' \
+        -c user.email='docker-build@example.invalid' \
+        commit -m 'Container snapshot'; \
+      git -C /tmp/vpp-src tag "$VPP_GIT_TAG_FALLBACK"; \
+    fi \
+ && make install-dep \
+ && rm -rf /tmp/vpp-src
+
+RUN chmod +x /usr/local/bin/vpp-dev-entrypoint
+
+WORKDIR /workspace/vpp
+
+ENTRYPOINT ["/usr/local/bin/vpp-dev-entrypoint"]
+CMD ["sleep", "infinity"]

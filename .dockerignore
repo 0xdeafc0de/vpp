@@ -1,0 +1,9 @@
+.cache
+build-root/build-*
+build-root/install-*
+build-root/packages
+build-root/downloads
+build-root/.ccache
+docs/_build
+**/__pycache__
+**/*.pyc
