@@ -122,6 +122,7 @@ VLIB_REGISTER_NODE (subscriber_dp_ip4_node) = {
   .name = "subscriber-dp-ip4",
   .vector_size = sizeof (u32),
   .type = VLIB_NODE_TYPE_INTERNAL,
+  .flags = VLIB_NODE_FLAG_TRACE_SUPPORTED,
   .format_trace = format_subscriber_dp_trace,
 };
 
@@ -129,6 +130,7 @@ VLIB_REGISTER_NODE (subscriber_dp_ip6_node) = {
   .name = "subscriber-dp-ip6",
   .vector_size = sizeof (u32),
   .type = VLIB_NODE_TYPE_INTERNAL,
+  .flags = VLIB_NODE_FLAG_TRACE_SUPPORTED,
   .format_trace = format_subscriber_dp_trace,
 };
 

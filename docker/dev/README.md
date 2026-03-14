@@ -22,6 +22,7 @@ The helper script supports both:
 - [compose.dev.yaml](/Users/sspingal/ws/yuvo/vpp/compose.dev.yaml): long-running dev container
 - [vpp-dev](/Users/sspingal/ws/yuvo/vpp/docker/dev/vpp-dev): helper wrapper around `docker compose`
 - [startup.conf](/Users/sspingal/ws/yuvo/vpp/docker/dev/startup.conf): default startup config for container runs
+- [subscriber-dp-lab](/Users/sspingal/ws/yuvo/vpp/docker/dev/subscriber-dp-lab): helper for wiring a traffic container to `vpp-dev`
 
 ## First-time setup
 
@@ -193,6 +194,38 @@ Then inside the container:
 ```bash
 /cache/vpp-build-root/install-vpp-native/vpp/bin/vppctl -s /run/vpp/cli.sock show version
 /cache/vpp-build-root/install-vpp-native/vpp/bin/vppctl -s /run/vpp/cli.sock show plugins
+```
+
+## subscriber_dp traffic lab
+
+To exercise the current `subscriber_dp` plugin with live traffic, use the lab
+helper:
+
+```bash
+docker/dev/subscriber-dp-lab prepare
+docker/dev/subscriber-dp-lab validate-ping
+docker/dev/subscriber-dp-lab status
+```
+
+What it does:
+
+- creates a `traffic` container with no Docker-managed data network
+- creates a dedicated `veth` pair
+- moves one end into `vpp-dev`
+- moves the other end into `traffic`
+- configures the VPP host-interface and a matching `subscriber_dp` entry
+- validates with `ping`
+
+Defaults:
+
+- traffic container IP: `10.10.0.2/24`
+- VPP host-interface IP: `10.10.0.1/24`
+- subscriber ID: `1001`
+
+Clean everything up with:
+
+```bash
+docker/dev/subscriber-dp-lab cleanup
 ```
 
 ## Startup config guidance

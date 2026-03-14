@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+
+if docker compose version >/dev/null 2>&1; then
+  compose=(docker compose -f "${repo_root}/compose.dev.yaml")
+elif command -v docker-compose >/dev/null 2>&1; then
+  compose=(docker-compose -f "${repo_root}/compose.dev.yaml")
+else
+  echo "Neither 'docker compose' nor 'docker-compose' is available." >&2
+  exit 1
+fi
+
+service=vpp-dev
+traffic_container=${TRAFFIC_CONTAINER:-traffic}
+vpp_if=${VPP_LAB_IF:-veth-vpp}
+traffic_if=${TRAFFIC_LAB_IF:-veth-traffic}
+host_if="host-${vpp_if}"
+traffic_ip_cidr=${TRAFFIC_IP_CIDR:-10.10.0.2/24}
+traffic_ip=${traffic_ip_cidr%%/*}
+vpp_ip_cidr=${VPP_IP_CIDR:-10.10.0.1/24}
+vpp_ip=${vpp_ip_cidr%%/*}
+subscriber_id=${SUBSCRIBER_ID:-1001}
+
+usage() {
+  cat <<EOF
+Usage:
+  docker/dev/subscriber-dp-lab cleanup
+  docker/dev/subscriber-dp-lab prepare
+  docker/dev/subscriber-dp-lab validate-ping
+  docker/dev/subscriber-dp-lab status
+EOF
+}
+
+require_running() {
+  "${compose[@]}" up -d "${service}" >/dev/null
+}
+
+container_pid() {
+  docker inspect -f '{{.State.Pid}}' "$1"
+}
+
+vppctl() {
+  "${compose[@]}" exec "${service}" bash -lc \
+    "/cache/vpp-build-root/install-vpp-native/vpp/bin/vppctl -s /run/vpp/cli.sock '$*'"
+}
+
+vpp_running() {
+  "${compose[@]}" exec "${service}" bash -lc \
+    "/cache/vpp-build-root/install-vpp-native/vpp/bin/vppctl -s /run/vpp/cli.sock show version >/dev/null 2>&1"
+}
+
+maybe_vppctl() {
+  if vpp_running; then
+    vppctl "$@"
+  else
+    echo "VPP is not running or CLI is not reachable, skipping: $*"
+  fi
+}
+
+vpp_interface_exists() {
+  "${compose[@]}" exec "${service}" bash -lc \
+    "/cache/vpp-build-root/install-vpp-native/vpp/bin/vppctl -s /run/vpp/cli.sock show interface '${host_if}' >/dev/null 2>&1"
+}
+
+cleanup_links_only() {
+  local vpp_pid=""
+  local traffic_pid=""
+
+  if docker ps --format '{{.Names}}' | grep -qx "${service}"; then
+    vpp_pid=$(container_pid "${service}")
+    sudo nsenter -t "${vpp_pid}" -n ip link del "${vpp_if}" 2>/dev/null || true
+  fi
+
+  if docker ps -a --format '{{.Names}}' | grep -qx "${traffic_container}"; then
+    traffic_pid=$(container_pid "${traffic_container}")
+    sudo nsenter -t "${traffic_pid}" -n ip link del "${traffic_if}" 2>/dev/null || true
+  fi
+
+  sudo ip link del "${vpp_if}" 2>/dev/null || true
+  sudo ip link del "${traffic_if}" 2>/dev/null || true
+}
+
+cleanup() {
+  require_running
+  if vpp_running && vpp_interface_exists; then
+    maybe_vppctl "subscriber-dp subscriber del ${host_if} address ${traffic_ip}" || true
+    maybe_vppctl "delete host-interface name ${vpp_if}" || true
+  fi
+  cleanup_links_only
+  docker rm -f "${traffic_container}" >/dev/null 2>&1 || true
+}
+
+prepare() {
+  local vpp_pid
+  local traffic_pid
+
+  require_running
+  if ! vpp_running; then
+    echo "VPP is not running in ${service}."
+    echo "Start it first, for example:"
+    echo "  docker/dev/vpp-dev run startup_configs/no_dpdk2.conf"
+    exit 1
+  fi
+  cleanup
+
+  docker run -d \
+    --name "${traffic_container}" \
+    --network none \
+    --cap-add NET_ADMIN \
+    --cap-add NET_RAW \
+    nicolaka/netshoot \
+    sleep infinity >/dev/null
+
+  vpp_pid=$(container_pid "${service}")
+  traffic_pid=$(container_pid "${traffic_container}")
+
+  sudo ip link add "${vpp_if}" type veth peer name "${traffic_if}"
+  sudo ip link set "${vpp_if}" netns "${vpp_pid}"
+  sudo ip link set "${traffic_if}" netns "${traffic_pid}"
+
+  sudo nsenter -t "${vpp_pid}" -n ip link set lo up
+  sudo nsenter -t "${vpp_pid}" -n ip link set "${vpp_if}" up
+
+  sudo nsenter -t "${traffic_pid}" -n ip link set lo up
+  sudo nsenter -t "${traffic_pid}" -n ip addr add "${traffic_ip_cidr}" dev "${traffic_if}"
+  sudo nsenter -t "${traffic_pid}" -n ip link set "${traffic_if}" up
+
+  maybe_vppctl "create host-interface name ${vpp_if}" || true
+  maybe_vppctl "set interface state ${host_if} up"
+  maybe_vppctl "set interface ip address ${host_if} ${vpp_ip_cidr}"
+  maybe_vppctl "subscriber-dp enable-disable ${host_if} ip4"
+  maybe_vppctl "subscriber-dp subscriber add ${host_if} address ${traffic_ip} id ${subscriber_id}"
+
+  echo "Prepared lab wiring:"
+  echo "  VPP container interface: ${vpp_if}"
+  echo "  Traffic container interface: ${traffic_if}"
+  echo "  VPP IP: ${vpp_ip_cidr}"
+  echo "  Traffic IP: ${traffic_ip_cidr}"
+  echo
+  status
+}
+
+validate_ping() {
+  docker exec "${traffic_container}" ping -c 3 "${vpp_ip}"
+  maybe_vppctl "show subscriber-dp"
+}
+
+status() {
+  local vpp_pid
+  local traffic_pid
+
+  vpp_pid=$(container_pid "${service}")
+  traffic_pid=$(container_pid "${traffic_container}")
+
+  echo "VPP-side link:"
+  sudo nsenter -t "${vpp_pid}" -n ip link show "${vpp_if}" || true
+  echo
+  echo "Traffic-side link:"
+  sudo nsenter -t "${traffic_pid}" -n ip link show "${traffic_if}" || true
+  echo
+  docker exec "${traffic_container}" ip addr show "${traffic_if}" || true
+  maybe_vppctl "show subscriber-dp"
+  maybe_vppctl "show subscriber-dp interfaces"
+}
+
+cmd=${1:-}
+case "${cmd}" in
+  cleanup)
+    cleanup
+    ;;
+  prepare)
+    prepare
+    ;;
+  validate-ping)
+    validate_ping
+    ;;
+  status)
+    status
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac

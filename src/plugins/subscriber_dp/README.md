@@ -48,15 +48,15 @@ stores the result in buffer metadata (`opaque2`) as:
 
 The plugin source lives in:
 
-- [subscriber_dp.c](/Users/sspingal/ws/vpp/src/plugins/subscriber_dp/subscriber_dp.c)
-- [subscriber_dp_node.c](/Users/sspingal/ws/vpp/src/plugins/subscriber_dp/subscriber_dp_node.c)
-- [subscriber_dp_api.c](/Users/sspingal/ws/vpp/src/plugins/subscriber_dp/subscriber_dp_api.c)
-- [subscriber_dp.api](/Users/sspingal/ws/vpp/src/plugins/subscriber_dp/subscriber_dp.api)
+- [subscriber_dp.c](/Users/sspingal/ws/yuvo/vpp/src/plugins/subscriber_dp/subscriber_dp.c)
+- [subscriber_dp_node.c](/Users/sspingal/ws/yuvo/vpp/src/plugins/subscriber_dp/subscriber_dp_node.c)
+- [subscriber_dp_api.c](/Users/sspingal/ws/yuvo/vpp/src/plugins/subscriber_dp/subscriber_dp_api.c)
+- [subscriber_dp.api](/Users/sspingal/ws/yuvo/vpp/src/plugins/subscriber_dp/subscriber_dp.api)
 
 Build it with the normal VPP build:
 
 ```bash
-cd /Users/sspingal/ws/vpp
+cd /Users/sspingal/ws/yuvo/vpp
 docker/dev/vpp-dev build-release
 ```
 
@@ -67,7 +67,7 @@ subscriber_dp_plugin.so
 ```
 
 Important: this plugin is marked `default_disabled = 1` in
-[plugin.c](/Users/sspingal/ws/vpp/src/plugins/subscriber_dp/plugin.c), so
+[plugin.c](/Users/sspingal/ws/yuvo/vpp/src/plugins/subscriber_dp/plugin.c), so
 you must explicitly enable it in `startup.conf`:
 
 ```conf
@@ -141,6 +141,7 @@ subscriber-dp subscriber add local0 address 2001:db8::10 id 3001
 
 ```text
 show subscriber-dp
+show subscriber-dp interfaces
 ```
 
 This displays:
@@ -148,11 +149,21 @@ This displays:
 - add/update/delete counters
 - lookup hit/miss counters
 - current subscriber entries
+- optionally, interfaces where the feature is enabled
+
+### Trace support
+
+The packet-path nodes support per-node tracing. Example:
+
+```text
+trace add subscriber-dp-ip4 20
+show trace
+```
 
 ## Binary APIs
 
 The plugin also exposes binary APIs defined in
-[subscriber_dp.api](/Users/sspingal/ws/vpp/src/plugins/subscriber_dp/subscriber_dp.api):
+[subscriber_dp.api](/Users/sspingal/ws/yuvo/vpp/src/plugins/subscriber_dp/subscriber_dp.api):
 
 - `subscriber_dp_enable_disable`
 - `subscriber_dp_subscriber_add`

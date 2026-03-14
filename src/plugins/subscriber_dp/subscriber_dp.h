@@ -6,6 +6,7 @@
 #include <vnet/vnet.h>
 #include <vnet/ip/ip.h>
 #include <vppinfra/bihash_24_8.h>
+#include <vppinfra/bitmap.h>
 #include <vppinfra/pool.h>
 
 typedef struct
@@ -30,6 +31,8 @@ typedef struct
 
   clib_bihash_24_8_t subscriber_by_key;
   subscriber_dp_entry_t *entries;
+  clib_bitmap_t *feature_enabled_ip4_by_sw_if;
+  clib_bitmap_t *feature_enabled_ip6_by_sw_if;
 
   u64 add_ops;
   u64 del_ops;

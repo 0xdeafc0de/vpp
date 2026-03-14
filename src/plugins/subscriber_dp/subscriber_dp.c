@@ -31,6 +31,18 @@ format_subscriber_dp_entry (u8 *s, va_list *args)
   return s;
 }
 
+static void
+subscriber_dp_record_feature_state (subscriber_dp_main_t *sm, u32 sw_if_index,
+                                    bool is_ip6, bool enable)
+{
+  if (is_ip6)
+    sm->feature_enabled_ip6_by_sw_if =
+      clib_bitmap_set (sm->feature_enabled_ip6_by_sw_if, sw_if_index, enable);
+  else
+    sm->feature_enabled_ip4_by_sw_if =
+      clib_bitmap_set (sm->feature_enabled_ip4_by_sw_if, sw_if_index, enable);
+}
+
 static clib_error_t *
 subscriber_dp_init (vlib_main_t *vm)
 {
@@ -56,9 +68,16 @@ subscriber_dp_enable_disable (u32 sw_if_index, bool is_ip6, bool enable)
                           sw_if_index))
     return VNET_API_ERROR_INVALID_SW_IF_INDEX;
 
-  return vnet_feature_enable_disable (is_ip6 ? "ip6-unicast" : "ip4-unicast",
-                                      is_ip6 ? "subscriber-dp-ip6" : "subscriber-dp-ip4",
-                                      sw_if_index, enable, 0, 0);
+  int rv =
+    vnet_feature_enable_disable (is_ip6 ? "ip6-unicast" : "ip4-unicast",
+                                 is_ip6 ? "subscriber-dp-ip6" :
+                                          "subscriber-dp-ip4",
+                                 sw_if_index, enable, 0, 0);
+
+  if (rv == 0)
+    subscriber_dp_record_feature_state (sm, sw_if_index, is_ip6, enable);
+
+  return rv;
 }
 
 static int
@@ -372,12 +391,19 @@ show_subscriber_dp_command_fn (vlib_main_t *vm, unformat_input_t *input,
 {
   subscriber_dp_main_t *sm = &subscriber_dp_main;
   subscriber_dp_entry_t *entry;
+  bool show_interfaces = false;
+  u32 sw_if_index;
 
   CLIB_UNUSED (vlib_cli_command_t * _cmd) = cmd;
 
-  if (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
-    return clib_error_return (0, "unknown input `%U'",
-                              format_unformat_error, input);
+  while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (input, "interfaces"))
+        show_interfaces = true;
+      else
+        return clib_error_return (0, "unknown input `%U'",
+                                  format_unformat_error, input);
+    }
 
   vlib_cli_output (vm,
                    "ops: add %llu update %llu del %llu lookup-hit %llu lookup-miss %llu",
@@ -386,6 +412,25 @@ show_subscriber_dp_command_fn (vlib_main_t *vm, unformat_input_t *input,
                    (unsigned long long) sm->del_ops,
                    (unsigned long long) sm->lookup_hits,
                    (unsigned long long) sm->lookup_misses);
+
+  if (show_interfaces)
+    {
+      vlib_cli_output (vm, "feature-enabled interfaces:");
+
+      clib_bitmap_foreach (sw_if_index, sm->feature_enabled_ip4_by_sw_if)
+        {
+          vlib_cli_output (vm, "  ip4 %U",
+                           format_vnet_sw_if_index_name, sm->vnet_main,
+                           sw_if_index);
+        }
+
+      clib_bitmap_foreach (sw_if_index, sm->feature_enabled_ip6_by_sw_if)
+        {
+          vlib_cli_output (vm, "  ip6 %U",
+                           format_vnet_sw_if_index_name, sm->vnet_main,
+                           sw_if_index);
+        }
+    }
 
   if (pool_elts (sm->entries) == 0)
     {
@@ -431,6 +476,6 @@ VLIB_CLI_COMMAND (subscriber_dp_subscriber_del_command, static) = {
 
 VLIB_CLI_COMMAND (show_subscriber_dp_command, static) = {
   .path = "show subscriber-dp",
-  .short_help = "show subscriber-dp",
+  .short_help = "show subscriber-dp [interfaces]",
   .function = show_subscriber_dp_command_fn,
 };
