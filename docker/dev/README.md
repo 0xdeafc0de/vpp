@@ -28,6 +28,29 @@ The helper script supports both:
 Make sure your machine has either the Docker Compose plugin or the legacy
 `docker-compose` binary installed.
 
+### Ubuntu 22.04 quick start
+
+On Ubuntu 22.04, a simple setup is:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y docker.io docker-compose
+sudo systemctl enable --now docker
+sudo usermod -aG docker "$USER"
+```
+
+After adding your user to the `docker` group, log out and log back in before
+running Docker commands without `sudo`.
+
+Depending on your installation, either of these may be available:
+
+```bash
+docker compose version
+docker-compose version
+```
+
+The helper script supports both forms.
+
 From the VPP repo root:
 
 ```bash
