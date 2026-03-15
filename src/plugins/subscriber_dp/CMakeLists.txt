@@ -5,6 +5,7 @@ add_vpp_plugin(subscriber_dp
   subscriber_dp.c
   subscriber_dp_api.c
   subscriber_dp_node.c
+  subscriber_dp_process.c
   plugin.c
 
   MULTIARCH_SOURCES

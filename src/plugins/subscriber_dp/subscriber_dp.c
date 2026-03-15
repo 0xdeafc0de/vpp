@@ -1,5 +1,11 @@
 #include <vlib/vlib.h>
 #include <vlib/threads.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <string.h>
+#include <unistd.h>
+#include <vnet/tcp/tcp_packet.h>
+#include <vnet/udp/udp_packet.h>
 
 #include "subscriber_dp.h"
 
@@ -53,6 +59,18 @@ subscriber_dp_init (vlib_main_t *vm)
 
   clib_bihash_init_24_8 (&sm->subscriber_by_key, "subscriber-dp-subscriber-by-key",
                          1024 /* buckets */, 1 << 20 /* memory */);
+  clib_bihash_init_48_8 (&sm->flow_by_key, "subscriber-dp-flow-by-key",
+                         1024 /* buckets */, 1 << 22 /* memory */);
+
+  sm->subscriber_sync_interval_sec = 10.0;
+  sm->flow_age_interval_sec = 10.0;
+  sm->stats_export_interval_sec = 10.0;
+  sm->service_interval_sec = 10.0;
+  sm->flow_timeout_sec = 60.0;
+  sm->subscriber_sync_max_per_tick = 1024;
+  sm->flow_age_max_remove_per_tick = 1024;
+  sm->stats_socket_path =
+    format (0, "/run/vpp/subscriber_dp_stats.sock%c", 0);
 
   return 0;
 }
@@ -193,6 +211,252 @@ subscriber_dp_lookup (subscriber_dp_main_t *sm, u32 sw_if_index,
 
   sm->lookup_hits++;
   return pool_elt_at_index (sm->entries, result.value);
+}
+
+typedef struct
+{
+  ip46_address_t src_address;
+  ip46_address_t dst_address;
+  u8 protocol;
+  u16 src_port;
+  u16 dst_port;
+} subscriber_dp_flow_key_parts_t;
+
+static bool
+subscriber_dp_get_flow_parts (vlib_main_t *vm, vlib_buffer_t *b, bool is_ip6,
+                              subscriber_dp_flow_key_parts_t *parts)
+{
+  u8 *current = vlib_buffer_get_current (b);
+  u32 packet_len = vlib_buffer_length_in_chain (vm, b);
+  u32 l4_offset = 0;
+
+  clib_memset (parts, 0, sizeof (*parts));
+
+  if (is_ip6)
+    {
+      ip6_header_t *ip6 = (ip6_header_t *) current;
+      if (packet_len < sizeof (*ip6))
+        return false;
+
+      parts->src_address.ip6 = ip6->src_address;
+      parts->dst_address.ip6 = ip6->dst_address;
+      parts->protocol = ip6->protocol;
+      l4_offset = sizeof (*ip6);
+    }
+  else
+    {
+      ip4_header_t *ip4 = (ip4_header_t *) current;
+      u32 ip4_hdr_bytes;
+
+      if (packet_len < sizeof (*ip4))
+        return false;
+
+      parts->src_address.ip4 = ip4->src_address;
+      parts->dst_address.ip4 = ip4->dst_address;
+      parts->protocol = ip4->protocol;
+      ip4_hdr_bytes = ip4_header_bytes (ip4);
+      if (packet_len < ip4_hdr_bytes)
+        return false;
+      l4_offset = ip4_hdr_bytes;
+    }
+
+  if (parts->protocol == IP_PROTOCOL_TCP)
+    {
+      tcp_header_t *tcp = (tcp_header_t *) (current + l4_offset);
+      if (packet_len < l4_offset + sizeof (*tcp))
+        return false;
+      parts->src_port = clib_net_to_host_u16 (tcp->src_port);
+      parts->dst_port = clib_net_to_host_u16 (tcp->dst_port);
+    }
+  else if (parts->protocol == IP_PROTOCOL_UDP)
+    {
+      udp_header_t *udp = (udp_header_t *) (current + l4_offset);
+      if (packet_len < l4_offset + sizeof (*udp))
+        return false;
+      parts->src_port = clib_net_to_host_u16 (udp->src_port);
+      parts->dst_port = clib_net_to_host_u16 (udp->dst_port);
+    }
+
+  return true;
+}
+
+void
+subscriber_dp_flow_touch (vlib_main_t *vm, vlib_buffer_t *b, u32 sw_if_index,
+                          bool is_ip6, u64 subscriber_id)
+{
+  subscriber_dp_main_t *sm = &subscriber_dp_main;
+  subscriber_dp_flow_key_parts_t parts;
+  clib_bihash_kv_48_8_t kv, result;
+  subscriber_dp_flow_entry_t *flow;
+  uword index;
+  f64 now = vlib_time_now (vm);
+  u64 bytes = vlib_buffer_length_in_chain (vm, b);
+
+  if (!subscriber_dp_get_flow_parts (vm, b, is_ip6, &parts))
+    return;
+
+  subscriber_dp_make_flow_kv (&kv, sw_if_index, &parts.src_address,
+                              &parts.dst_address, is_ip6, parts.protocol,
+                              parts.src_port, parts.dst_port);
+
+  if (clib_bihash_search_48_8 (&sm->flow_by_key, &kv, &result) == 0)
+    {
+      flow = pool_elt_at_index (sm->flows, result.value);
+      flow->last_seen_at = now;
+      flow->subscriber_id = subscriber_id;
+      flow->packets++;
+      flow->bytes += bytes;
+      sm->flow_updates++;
+    }
+  else
+    {
+      pool_get_zero (sm->flows, flow);
+      index = flow - sm->flows;
+      flow->src_address = parts.src_address;
+      flow->dst_address = parts.dst_address;
+      flow->sw_if_index = sw_if_index;
+      flow->subscriber_id = subscriber_id;
+      flow->created_at = now;
+      flow->last_seen_at = now;
+      flow->packets = 1;
+      flow->bytes = bytes;
+      flow->src_port = parts.src_port;
+      flow->dst_port = parts.dst_port;
+      flow->protocol = parts.protocol;
+      flow->is_ip6 = is_ip6;
+      kv.value = index;
+      clib_bihash_add_del_48_8 (&sm->flow_by_key, &kv, 1 /* is_add */);
+      sm->flow_adds++;
+    }
+
+  sm->flow_packets++;
+  sm->flow_bytes += bytes;
+}
+
+u32
+subscriber_dp_age_flows (subscriber_dp_main_t *sm, f64 now)
+{
+  u32 removed = 0;
+  u32 index;
+  u32 *to_delete = 0;
+  subscriber_dp_flow_entry_t *flow;
+
+  pool_foreach_index (index, sm->flows)
+    {
+      flow = pool_elt_at_index (sm->flows, index);
+      if ((now - flow->last_seen_at) < sm->flow_timeout_sec)
+        continue;
+
+      vec_add1 (to_delete, index);
+      if (vec_len (to_delete) >= sm->flow_age_max_remove_per_tick)
+        break;
+    }
+
+  vec_foreach_index (index, to_delete)
+    {
+      clib_bihash_kv_48_8_t kv;
+      flow = pool_elt_at_index (sm->flows, to_delete[index]);
+      subscriber_dp_make_flow_kv (&kv, flow->sw_if_index, &flow->src_address,
+                                  &flow->dst_address, flow->is_ip6,
+                                  flow->protocol, flow->src_port,
+                                  flow->dst_port);
+      clib_bihash_add_del_48_8 (&sm->flow_by_key, &kv, 0 /* is_add */);
+      pool_put_index (sm->flows, to_delete[index]);
+      removed++;
+    }
+
+  vec_free (to_delete);
+  sm->flow_age_runs++;
+  sm->flow_age_removed += removed;
+  sm->flow_deletes += removed;
+  return removed;
+}
+
+u32
+subscriber_dp_run_subscriber_sync (subscriber_dp_main_t *sm)
+{
+  sm->subscriber_sync_runs++;
+  return 0;
+}
+
+int
+subscriber_dp_export_stats (subscriber_dp_main_t *sm)
+{
+  int fd;
+  struct sockaddr_un addr;
+  u8 *msg = 0;
+  int rv = -1;
+
+  if (!sm->stats_socket_path || !sm->stats_socket_path[0])
+    return -1;
+
+  fd = -1;
+  fd = socket (AF_UNIX, SOCK_STREAM, 0);
+  if (fd < 0)
+    goto done;
+
+  clib_memset (&addr, 0, sizeof (addr));
+  addr.sun_family = AF_UNIX;
+  strncpy (addr.sun_path, (char *) sm->stats_socket_path,
+           sizeof (addr.sun_path) - 1);
+
+  if (connect (fd, (struct sockaddr *) &addr, sizeof (addr)) < 0)
+    goto done;
+
+  msg = format (0,
+                "lookup_hit=%llu lookup_miss=%llu lookup_drop=%llu flow_active=%u flow_add=%llu flow_update=%llu flow_del=%llu\n",
+                (unsigned long long) sm->lookup_hits,
+                (unsigned long long) sm->lookup_misses,
+                (unsigned long long) sm->lookup_drops,
+                pool_elts (sm->flows),
+                (unsigned long long) sm->flow_adds,
+                (unsigned long long) sm->flow_updates,
+                (unsigned long long) sm->flow_deletes);
+
+  if (write (fd, msg, vec_len (msg) - 1) >= 0)
+    rv = 0;
+
+done:
+  if (fd >= 0)
+    close (fd);
+  vec_free (msg);
+  sm->stats_export_runs++;
+  if (rv != 0)
+    sm->stats_export_failures++;
+  return rv;
+}
+
+void
+subscriber_dp_run_service_maintenance (subscriber_dp_main_t *sm)
+{
+  sm->policy_refresh_runs++;
+  sm->oam_health_runs++;
+  sm->cluster_sync_runs++;
+}
+
+static u8 *
+format_subscriber_dp_flow (u8 *s, va_list *args)
+{
+  subscriber_dp_flow_entry_t *flow = va_arg (*args, subscriber_dp_flow_entry_t *);
+  vnet_main_t *vnm = vnet_get_main ();
+
+  s = format (s, "interface %U proto %u ", format_vnet_sw_if_index_name, vnm,
+              flow->sw_if_index, flow->protocol);
+  if (flow->is_ip6)
+    s = format (s, "%U:%u -> %U:%u", format_ip6_address, &flow->src_address.ip6,
+                flow->src_port, format_ip6_address, &flow->dst_address.ip6,
+                flow->dst_port);
+  else
+    s = format (s, "%U:%u -> %U:%u", format_ip4_address, &flow->src_address.ip4,
+                flow->src_port, format_ip4_address, &flow->dst_address.ip4,
+                flow->dst_port);
+
+  s = format (s, " subscriber-id %llu packets %llu bytes %llu age %.2f",
+              (unsigned long long) flow->subscriber_id,
+              (unsigned long long) flow->packets,
+              (unsigned long long) flow->bytes,
+              flow->last_seen_at - flow->created_at);
+  return s;
 }
 
 static clib_error_t *
@@ -392,6 +656,8 @@ show_subscriber_dp_command_fn (vlib_main_t *vm, unformat_input_t *input,
   subscriber_dp_main_t *sm = &subscriber_dp_main;
   subscriber_dp_entry_t *entry;
   bool show_interfaces = false;
+  bool show_flows = false;
+  bool show_services = false;
   u32 sw_if_index;
 
   CLIB_UNUSED (vlib_cli_command_t * _cmd) = cmd;
@@ -400,18 +666,26 @@ show_subscriber_dp_command_fn (vlib_main_t *vm, unformat_input_t *input,
     {
       if (unformat (input, "interfaces"))
         show_interfaces = true;
+      else if (unformat (input, "flows"))
+        show_flows = true;
+      else if (unformat (input, "services"))
+        show_services = true;
       else
         return clib_error_return (0, "unknown input `%U'",
                                   format_unformat_error, input);
     }
 
   vlib_cli_output (vm,
-                   "ops: add %llu update %llu del %llu lookup-hit %llu lookup-miss %llu",
+                   "ops: add %llu update %llu del %llu lookup-hit %llu lookup-miss %llu lookup-drop %llu flow-active %u flow-add %llu flow-update %llu flow-del %llu",
                    (unsigned long long) sm->add_ops,
                    (unsigned long long) sm->update_ops,
                    (unsigned long long) sm->del_ops,
                    (unsigned long long) sm->lookup_hits,
-                   (unsigned long long) sm->lookup_misses);
+                   (unsigned long long) sm->lookup_misses,
+                   (unsigned long long) sm->lookup_drops, pool_elts (sm->flows),
+                   (unsigned long long) sm->flow_adds,
+                   (unsigned long long) sm->flow_updates,
+                   (unsigned long long) sm->flow_deletes);
 
   if (show_interfaces)
     {
@@ -432,15 +706,50 @@ show_subscriber_dp_command_fn (vlib_main_t *vm, unformat_input_t *input,
         }
     }
 
-  if (pool_elts (sm->entries) == 0)
+  if (show_services)
     {
-      vlib_cli_output (vm, "no subscriber entries");
-      return 0;
+      vlib_cli_output (vm,
+                       "services: subscriber-sync runs %llu processed %llu flow-aging runs %llu removed %llu stats-export runs %llu failures %llu policy-refresh %llu oam-health %llu cluster-sync %llu",
+                       (unsigned long long) sm->subscriber_sync_runs,
+                       (unsigned long long) sm->subscriber_sync_processed,
+                       (unsigned long long) sm->flow_age_runs,
+                       (unsigned long long) sm->flow_age_removed,
+                       (unsigned long long) sm->stats_export_runs,
+                       (unsigned long long) sm->stats_export_failures,
+                       (unsigned long long) sm->policy_refresh_runs,
+                       (unsigned long long) sm->oam_health_runs,
+                       (unsigned long long) sm->cluster_sync_runs);
+      vlib_cli_output (vm,
+                       "config: subscriber-sync %.1fs flow-aging %.1fs timeout %.1fs max-remove %u stats-export %.1fs socket %s service-loop %.1fs",
+                       sm->subscriber_sync_interval_sec,
+                       sm->flow_age_interval_sec,
+                       sm->flow_timeout_sec,
+                       sm->flow_age_max_remove_per_tick,
+                       sm->stats_export_interval_sec,
+                       sm->stats_socket_path ?
+                         (char *) sm->stats_socket_path : "(disabled)",
+                       sm->service_interval_sec);
     }
 
-  pool_foreach (entry, sm->entries)
+  if (pool_elts (sm->entries) == 0)
+    vlib_cli_output (vm, "no subscriber entries");
+  else
+    pool_foreach (entry, sm->entries)
+      {
+        vlib_cli_output (vm, "%U", format_subscriber_dp_entry, entry);
+      }
+
+  if (show_flows)
     {
-      vlib_cli_output (vm, "%U", format_subscriber_dp_entry, entry);
+      subscriber_dp_flow_entry_t *flow;
+
+      if (pool_elts (sm->flows) == 0)
+        vlib_cli_output (vm, "no active flows");
+      else
+        pool_foreach (flow, sm->flows)
+          {
+            vlib_cli_output (vm, "%U", format_subscriber_dp_flow, flow);
+          }
     }
 
   return 0;
@@ -476,6 +785,6 @@ VLIB_CLI_COMMAND (subscriber_dp_subscriber_del_command, static) = {
 
 VLIB_CLI_COMMAND (show_subscriber_dp_command, static) = {
   .path = "show subscriber-dp",
-  .short_help = "show subscriber-dp [interfaces]",
+  .short_help = "show subscriber-dp [interfaces] [flows] [services]",
   .function = show_subscriber_dp_command_fn,
 };

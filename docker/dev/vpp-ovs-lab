@@ -1,0 +1,439 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+
+if docker compose version >/dev/null 2>&1; then
+  compose=(docker compose -f "${repo_root}/compose.dev.yaml")
+elif command -v docker-compose >/dev/null 2>&1; then
+  compose=(docker-compose -f "${repo_root}/compose.dev.yaml")
+else
+  echo "Neither 'docker compose' nor 'docker-compose' is available." >&2
+  exit 1
+fi
+
+service=vpp-dev
+client_container=${OVS_LAB_CLIENT_CONTAINER:-traffic-client}
+server_container=${OVS_LAB_SERVER_CONTAINER:-traffic-server}
+traffic_image=${OVS_LAB_TRAFFIC_IMAGE:-nicolaka/netshoot}
+
+bridge_a=${OVS_LAB_BRIDGE_A:-br-vpp-a}
+bridge_b=${OVS_LAB_BRIDGE_B:-br-vpp-b}
+
+vpp_if_a=${OVS_LAB_VPP_IF_A:-vpp-a}
+vpp_if_b=${OVS_LAB_VPP_IF_B:-vpp-b}
+client_if=${OVS_LAB_CLIENT_IF:-client0}
+server_if=${OVS_LAB_SERVER_IF:-server0}
+
+host_if_a="host-${vpp_if_a}"
+host_if_b="host-${vpp_if_b}"
+
+br_port_vpp_a=${OVS_LAB_BR_PORT_VPP_A:-patch-vpp-a}
+br_port_vpp_b=${OVS_LAB_BR_PORT_VPP_B:-patch-vpp-b}
+br_port_client=${OVS_LAB_BR_PORT_CLIENT:-patch-client}
+br_port_server=${OVS_LAB_BR_PORT_SERVER:-patch-server}
+
+client_ip_cidr=${OVS_LAB_CLIENT_IP_CIDR:-192.168.10.2/24}
+server_ip_cidr=${OVS_LAB_SERVER_IP_CIDR:-192.168.20.2/24}
+vpp_ip_a_cidr=${OVS_LAB_VPP_IP_A_CIDR:-192.168.10.1/24}
+vpp_ip_b_cidr=${OVS_LAB_VPP_IP_B_CIDR:-192.168.20.1/24}
+
+client_ip=${client_ip_cidr%%/*}
+server_ip=${server_ip_cidr%%/*}
+vpp_ip_a=${vpp_ip_a_cidr%%/*}
+vpp_ip_b=${vpp_ip_b_cidr%%/*}
+client_subscriber_id=${OVS_LAB_CLIENT_SUBSCRIBER_ID:-1001}
+server_subscriber_id=${OVS_LAB_SERVER_SUBSCRIBER_ID:-2001}
+
+usage() {
+  cat <<EOF
+Usage:
+  docker/dev/vpp-ovs-lab cleanup
+  docker/dev/vpp-ovs-lab prepare
+  docker/dev/vpp-ovs-lab enable-subscriber-dp
+  docker/dev/vpp-ovs-lab disable-subscriber-dp
+  docker/dev/vpp-ovs-lab validate-ping
+  docker/dev/vpp-ovs-lab validate-iperf [tcp|udp] [--reverse] [--parallel N] [--time SEC] [--bandwidth RATE]
+  docker/dev/vpp-ovs-lab benchmark
+  docker/dev/vpp-ovs-lab status
+EOF
+}
+
+require_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "Missing required command: $1" >&2
+    exit 1
+  fi
+}
+
+require_running() {
+  "${compose[@]}" up -d "${service}" >/dev/null
+}
+
+container_pid() {
+  docker inspect -f '{{.State.Pid}}' "$1"
+}
+
+vppctl() {
+  "${compose[@]}" exec "${service}" bash -lc \
+    "/cache/vpp-build-root/install-vpp-native/vpp/bin/vppctl -s /run/vpp/cli.sock '$*'"
+}
+
+vpp_running() {
+  "${compose[@]}" exec "${service}" bash -lc \
+    "/cache/vpp-build-root/install-vpp-native/vpp/bin/vppctl -s /run/vpp/cli.sock show version >/dev/null 2>&1"
+}
+
+require_vpp_running() {
+  require_running
+  if ! vpp_running; then
+    echo "VPP is not running in ${service}."
+    echo "Start it first, for example:"
+    echo "  docker/dev/vpp-dev run startup_configs/no_dpdk2.conf"
+    exit 1
+  fi
+}
+
+container_exists() {
+  docker ps -a --format '{{.Names}}' | grep -qx "$1"
+}
+
+container_running() {
+  docker ps --format '{{.Names}}' | grep -qx "$1"
+}
+
+ensure_traffic_tools() {
+  docker exec "${client_container}" bash -lc "command -v ip >/dev/null && command -v ping >/dev/null && command -v iperf3 >/dev/null"
+  docker exec "${server_container}" bash -lc "command -v ip >/dev/null && command -v ping >/dev/null && command -v iperf3 >/dev/null"
+}
+
+delete_vpp_host_if() {
+  local if_name=$1
+  if vppctl "show interface ${if_name}" >/dev/null 2>&1; then
+    vppctl "delete host-interface name ${if_name#host-}" >/dev/null 2>&1 || true
+  fi
+}
+
+cleanup_links() {
+  local vpp_pid=""
+  local client_pid=""
+  local server_pid=""
+
+  if container_running "${service}"; then
+    vpp_pid=$(container_pid "${service}")
+    sudo nsenter -t "${vpp_pid}" -n ip link del "${vpp_if_a}" 2>/dev/null || true
+    sudo nsenter -t "${vpp_pid}" -n ip link del "${vpp_if_b}" 2>/dev/null || true
+  fi
+
+  if container_exists "${client_container}"; then
+    client_pid=$(container_pid "${client_container}")
+    sudo nsenter -t "${client_pid}" -n ip link del "${client_if}" 2>/dev/null || true
+  fi
+
+  if container_exists "${server_container}"; then
+    server_pid=$(container_pid "${server_container}")
+    sudo nsenter -t "${server_pid}" -n ip link del "${server_if}" 2>/dev/null || true
+  fi
+
+  sudo ip link del "${br_port_vpp_a}" 2>/dev/null || true
+  sudo ip link del "${br_port_vpp_b}" 2>/dev/null || true
+  sudo ip link del "${br_port_client}" 2>/dev/null || true
+  sudo ip link del "${br_port_server}" 2>/dev/null || true
+}
+
+cleanup_ovs() {
+  sudo ovs-vsctl --if-exists del-port "${bridge_a}" "${br_port_vpp_a}"
+  sudo ovs-vsctl --if-exists del-port "${bridge_a}" "${br_port_client}"
+  sudo ovs-vsctl --if-exists del-port "${bridge_b}" "${br_port_vpp_b}"
+  sudo ovs-vsctl --if-exists del-port "${bridge_b}" "${br_port_server}"
+  sudo ovs-vsctl --if-exists del-br "${bridge_a}"
+  sudo ovs-vsctl --if-exists del-br "${bridge_b}"
+}
+
+cleanup() {
+  require_cmd ovs-vsctl
+  require_cmd nsenter
+  require_cmd ip
+  require_running
+
+  if vpp_running; then
+    delete_vpp_host_if "${host_if_a}"
+    delete_vpp_host_if "${host_if_b}"
+  fi
+
+  cleanup_links
+  docker rm -f "${client_container}" "${server_container}" >/dev/null 2>&1 || true
+  cleanup_ovs
+}
+
+prepare_container() {
+  local name=$1
+
+  docker run -d \
+    --name "${name}" \
+    --network none \
+    --cap-add NET_ADMIN \
+    --cap-add NET_RAW \
+    "${traffic_image}" \
+    sleep infinity >/dev/null
+}
+
+create_bridge() {
+  local bridge=$1
+  sudo ovs-vsctl --may-exist add-br "${bridge}"
+  sudo ip link set "${bridge}" up
+}
+
+attach_pair() {
+  local host_side=$1
+  local ns_side=$2
+  local target_pid=$3
+  local bridge=$4
+
+  sudo ip link add "${host_side}" type veth peer name "${ns_side}"
+  sudo ovs-vsctl --may-exist add-port "${bridge}" "${host_side}"
+  sudo ip link set "${host_side}" up
+  sudo ip link set "${ns_side}" netns "${target_pid}"
+}
+
+configure_ns_if() {
+  local pid=$1
+  local if_name=$2
+  local addr=$3
+  local gw=$4
+
+  sudo nsenter -t "${pid}" -n ip link set lo up
+  sudo nsenter -t "${pid}" -n ip addr flush dev "${if_name}"
+  sudo nsenter -t "${pid}" -n ip addr add "${addr}" dev "${if_name}"
+  sudo nsenter -t "${pid}" -n ip link set "${if_name}" up
+  sudo nsenter -t "${pid}" -n ip route replace default via "${gw}"
+}
+
+configure_vpp_if() {
+  local linux_if=$1
+  local vpp_if=$2
+  local addr=$3
+
+  if ! vppctl "show interface ${vpp_if}" >/dev/null 2>&1; then
+    vppctl "create host-interface name ${linux_if}"
+  fi
+  vppctl "set interface state ${vpp_if} up"
+  vppctl "set interface ip address ${vpp_if} ${addr}"
+}
+
+prepare() {
+  local vpp_pid
+  local client_pid
+  local server_pid
+
+  require_cmd ovs-vsctl
+  require_cmd nsenter
+  require_cmd ip
+  require_vpp_running
+
+  cleanup
+
+  create_bridge "${bridge_a}"
+  create_bridge "${bridge_b}"
+
+  prepare_container "${client_container}"
+  prepare_container "${server_container}"
+  ensure_traffic_tools
+
+  vpp_pid=$(container_pid "${service}")
+  client_pid=$(container_pid "${client_container}")
+  server_pid=$(container_pid "${server_container}")
+
+  attach_pair "${br_port_vpp_a}" "${vpp_if_a}" "${vpp_pid}" "${bridge_a}"
+  attach_pair "${br_port_client}" "${client_if}" "${client_pid}" "${bridge_a}"
+  attach_pair "${br_port_vpp_b}" "${vpp_if_b}" "${vpp_pid}" "${bridge_b}"
+  attach_pair "${br_port_server}" "${server_if}" "${server_pid}" "${bridge_b}"
+
+  sudo nsenter -t "${vpp_pid}" -n ip link set lo up
+  sudo nsenter -t "${vpp_pid}" -n ip link set "${vpp_if_a}" up
+  sudo nsenter -t "${vpp_pid}" -n ip link set "${vpp_if_b}" up
+
+  configure_ns_if "${client_pid}" "${client_if}" "${client_ip_cidr}" "${vpp_ip_a}"
+  configure_ns_if "${server_pid}" "${server_if}" "${server_ip_cidr}" "${vpp_ip_b}"
+
+  configure_vpp_if "${vpp_if_a}" "${host_if_a}" "${vpp_ip_a_cidr}"
+  configure_vpp_if "${vpp_if_b}" "${host_if_b}" "${vpp_ip_b_cidr}"
+
+  echo "Prepared OVS forwarding lab:"
+  echo "  ${bridge_a}: ${vpp_ip_a} <-> ${client_ip}"
+  echo "  ${bridge_b}: ${vpp_ip_b} <-> ${server_ip}"
+  echo "  VPP interfaces: ${host_if_a}, ${host_if_b}"
+  echo "  Traffic containers: ${client_container}, ${server_container}"
+  echo
+  status
+}
+
+validate_ping() {
+  docker exec "${client_container}" ping -c 3 "${server_ip}"
+  vppctl "show interface address"
+}
+
+start_iperf_server() {
+  docker exec "${server_container}" bash -lc \
+    "pkill iperf3 >/dev/null 2>&1 || true; nohup iperf3 -s >/tmp/iperf3-server.log 2>&1 &"
+  sleep 1
+}
+
+enable_subscriber_dp() {
+  require_vpp_running
+  vppctl "subscriber-dp enable-disable ${host_if_a} ip4"
+  vppctl "subscriber-dp enable-disable ${host_if_b} ip4"
+  vppctl "subscriber-dp subscriber del ${host_if_a} address ${client_ip}" >/dev/null 2>&1 || true
+  vppctl "subscriber-dp subscriber del ${host_if_b} address ${server_ip}" >/dev/null 2>&1 || true
+  vppctl "subscriber-dp subscriber add ${host_if_a} address ${client_ip} id ${client_subscriber_id}"
+  vppctl "subscriber-dp subscriber add ${host_if_b} address ${server_ip} id ${server_subscriber_id}"
+  vppctl "show subscriber-dp interfaces"
+  vppctl "show subscriber-dp"
+}
+
+disable_subscriber_dp() {
+  require_vpp_running
+  vppctl "subscriber-dp subscriber del ${host_if_a} address ${client_ip}" >/dev/null 2>&1 || true
+  vppctl "subscriber-dp subscriber del ${host_if_b} address ${server_ip}" >/dev/null 2>&1 || true
+  vppctl "subscriber-dp enable-disable ${host_if_a} ip4 disable" >/dev/null 2>&1 || true
+  vppctl "subscriber-dp enable-disable ${host_if_b} ip4 disable" >/dev/null 2>&1 || true
+  vppctl "show subscriber-dp interfaces" || true
+  vppctl "show subscriber-dp" || true
+}
+
+validate_iperf() {
+  local proto=${1:-tcp}
+  local reverse=0
+  local parallel=1
+  local duration=10
+  local bandwidth=2G
+
+  if [ "$#" -gt 0 ]; then
+    shift
+  fi
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --reverse)
+        reverse=1
+        ;;
+      --parallel)
+        shift
+        parallel=${1:?missing value for --parallel}
+        ;;
+      --time)
+        shift
+        duration=${1:?missing value for --time}
+        ;;
+      --bandwidth)
+        shift
+        bandwidth=${1:?missing value for --bandwidth}
+        ;;
+      *)
+        echo "Unknown option: $1" >&2
+        usage
+        exit 1
+        ;;
+    esac
+    shift
+  done
+
+  start_iperf_server
+
+  case "${proto}" in
+    tcp)
+      if [ "${parallel}" -gt 1 ]; then
+        docker exec "${client_container}" \
+          iperf3 -c "${server_ip}" -t "${duration}" -P "${parallel}" \
+          $([ "${reverse}" -eq 1 ] && printf '%s' "-R")
+      else
+        docker exec "${client_container}" \
+          iperf3 -c "${server_ip}" -t "${duration}" \
+          $([ "${reverse}" -eq 1 ] && printf '%s' "-R")
+      fi
+      ;;
+    udp)
+      docker exec "${client_container}" \
+        iperf3 -u -c "${server_ip}" -t "${duration}" -b "${bandwidth}" \
+        $([ "${reverse}" -eq 1 ] && printf '%s' "-R")
+      ;;
+    *)
+      echo "Unsupported protocol '${proto}'. Use tcp or udp." >&2
+      exit 1
+      ;;
+  esac
+}
+
+benchmark() {
+  echo "TCP single stream:"
+  validate_iperf tcp --time 10
+  echo
+  echo "TCP reverse single stream:"
+  validate_iperf tcp --reverse --time 10
+  echo
+  echo "TCP four parallel streams:"
+  validate_iperf tcp --parallel 4 --time 10
+  echo
+  echo "UDP at 1G:"
+  validate_iperf udp --bandwidth 1G --time 10
+}
+
+status() {
+  local vpp_pid
+  local client_pid
+  local server_pid
+
+  vpp_pid=$(container_pid "${service}")
+  client_pid=$(container_pid "${client_container}")
+  server_pid=$(container_pid "${server_container}")
+
+  echo "OVS bridges:"
+  sudo ovs-vsctl show
+  echo
+  echo "VPP-side links:"
+  sudo nsenter -t "${vpp_pid}" -n ip link show "${vpp_if_a}" || true
+  sudo nsenter -t "${vpp_pid}" -n ip link show "${vpp_if_b}" || true
+  echo
+  echo "Client-side link:"
+  sudo nsenter -t "${client_pid}" -n ip addr show "${client_if}" || true
+  echo
+  echo "Server-side link:"
+  sudo nsenter -t "${server_pid}" -n ip addr show "${server_if}" || true
+  echo
+  vppctl "show interface address" || true
+  echo
+  vppctl "show ip fib" || true
+}
+
+cmd=${1:-}
+case "${cmd}" in
+  cleanup)
+    cleanup
+    ;;
+  prepare)
+    prepare
+    ;;
+  enable-subscriber-dp)
+    enable_subscriber_dp
+    ;;
+  disable-subscriber-dp)
+    disable_subscriber_dp
+    ;;
+  validate-ping)
+    validate_ping
+    ;;
+  validate-iperf)
+    shift
+    validate_iperf "$@"
+    ;;
+  benchmark)
+    benchmark
+    ;;
+  status)
+    status
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac
