@@ -23,6 +23,7 @@ The helper script supports both:
 - [vpp-dev](/Users/sspingal/ws//vpp/docker/dev/vpp-dev): helper wrapper around `docker compose`
 - [startup.conf](/Users/sspingal/ws//vpp/docker/dev/startup.conf): default startup config for container runs
 - [subscriber-dp-lab](/Users/sspingal/ws//vpp/docker/dev/subscriber-dp-lab): helper for wiring a traffic container to `vpp-dev`
+- [vpp-ovs-lab](/Users/sspingal/ws//vpp/docker/dev/vpp-ovs-lab): helper for wiring two traffic containers through OVS and VPP for plain L3 forwarding
 
 ## First-time setup
 
@@ -35,8 +36,9 @@ On Ubuntu 22.04, a simple setup is:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y docker.io docker-compose
+sudo apt-get install -y docker.io docker-compose openvswitch-switch iproute2
 sudo systemctl enable --now docker
+sudo systemctl enable --now openvswitch-switch
 sudo usermod -aG docker "$USER"
 ```
 
@@ -226,6 +228,141 @@ Clean everything up with:
 
 ```bash
 docker/dev/subscriber-dp-lab cleanup
+```
+
+## OVS L3 forwarding lab
+
+To exercise plain VPP L3 forwarding without `subscriber_dp`, use the OVS lab
+helper:
+
+```bash
+docker/dev/vpp-ovs-lab prepare
+docker/dev/vpp-ovs-lab enable-subscriber-dp
+docker/dev/vpp-ovs-lab validate-ping
+docker/dev/vpp-ovs-lab validate-iperf tcp
+docker/dev/vpp-ovs-lab validate-iperf tcp --parallel 4
+docker/dev/vpp-ovs-lab validate-iperf udp --bandwidth 1G
+docker/dev/vpp-ovs-lab benchmark
+docker/dev/vpp-ovs-lab status
+```
+
+What it does:
+
+- creates two OVS bridges, one per L3 segment
+- creates a `traffic-client` container and a `traffic-server` container
+- wires both traffic containers and the `vpp-dev` container into OVS using
+  dedicated `veth` pairs
+- creates `host-vpp-a` and `host-vpp-b` inside VPP and configures them as the
+  default gateway on both subnets
+- validates connectivity with `ping`
+- runs `iperf3` from the client container to the server container through VPP
+
+Topology:
+
+```text
+traffic-client 192.168.10.2/24 -- OVS bridge br-vpp-a -- vpp-dev host-vpp-a 192.168.10.1/24
+traffic-server 192.168.20.2/24 -- OVS bridge br-vpp-b -- vpp-dev host-vpp-b 192.168.20.1/24
+```
+
+The client container uses `192.168.10.1` as its default gateway. The server
+container uses `192.168.20.1` as its default gateway.
+
+Routing explanation:
+
+- OVS is only switching Ethernet frames inside each subnet
+- VPP is routing between the two connected subnets
+- we do not add static routes in VPP because `set interface ip address` creates
+  connected routes automatically
+- we do add default routes inside the traffic containers, pointing at the VPP
+  interface IP on each subnet
+- once both VPP interfaces are up with IP addresses, forwarding between
+  `192.168.10.0/24` and `192.168.20.0/24` works without any extra route CLI
+
+To enforce subscriber-aware admission, first start VPP with the plugin enabled
+in your startup config, then run:
+
+```bash
+docker/dev/vpp-ovs-lab enable-subscriber-dp
+```
+
+That enables `subscriber_dp` on `host-vpp-a` and `host-vpp-b`, then adds the
+default subscriber entries for:
+
+- `192.168.10.2` on `host-vpp-a`
+- `192.168.20.2` on `host-vpp-b`
+
+With the new node behavior, packets miss-dropping is now the default once the
+feature is enabled on an interface.
+
+Manual VPP CLI equivalent:
+
+```text
+subscriber-dp enable-disable host-vpp-a ip4
+subscriber-dp enable-disable host-vpp-b ip4
+
+subscriber-dp subscriber add host-vpp-a address 192.168.10.2 id 1
+subscriber-dp subscriber add host-vpp-b address 192.168.20.2 id 2
+```
+
+Those subscriber IPs are the ingress source addresses VPP actually sees on the
+two interfaces. They are not the VPP gateway addresses.
+
+Disable it again with:
+
+```bash
+docker/dev/vpp-ovs-lab disable-subscriber-dp
+```
+
+Useful `iperf3` variants:
+
+- TCP single stream:
+  `docker/dev/vpp-ovs-lab validate-iperf tcp`
+- TCP reverse:
+  `docker/dev/vpp-ovs-lab validate-iperf tcp --reverse`
+- TCP four streams:
+  `docker/dev/vpp-ovs-lab validate-iperf tcp --parallel 4`
+- UDP with explicit rate:
+  `docker/dev/vpp-ovs-lab validate-iperf udp --bandwidth 1G`
+- Default benchmark suite:
+  `docker/dev/vpp-ovs-lab benchmark`
+
+Useful subscriber tests:
+
+- positive case:
+  enable `subscriber_dp`, keep both subscriber entries, then run
+  `docker/dev/vpp-ovs-lab validate-ping` or `docker/dev/vpp-ovs-lab validate-iperf tcp`
+- negative case:
+  delete one subscriber entry, for example
+  `subscriber-dp subscriber del host-vpp-b address 192.168.20.2`
+  then retry ping or `iperf3` and watch `lookup-miss` / `lookup-drop` increase
+  in `show subscriber-dp`
+
+Useful observability commands in VPP:
+
+```text
+show subscriber-dp
+show subscriber-dp interfaces
+show subscriber-dp flows
+show subscriber-dp services
+show ip fib
+show ip neighbor
+```
+
+Defaults:
+
+- bridge A subnet: `192.168.10.0/24`
+- bridge B subnet: `192.168.20.0/24`
+- VPP gateway IPs: `192.168.10.1/24` and `192.168.20.1/24`
+- client IP: `192.168.10.2/24`
+- server IP: `192.168.20.2/24`
+
+This lab intentionally uses OVS only as an L2 switch. VPP does the L3
+forwarding.
+
+Clean everything up with:
+
+```bash
+docker/dev/vpp-ovs-lab cleanup
 ```
 
 ## Startup config guidance
