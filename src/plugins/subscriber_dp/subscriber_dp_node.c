@@ -10,8 +10,25 @@ typedef struct
   u32 sw_if_index;
   u64 subscriber_id;
   u8 hit;
+  u8 dropped;
   u8 is_ip6;
 } subscriber_dp_trace_t;
+
+typedef enum
+{
+  SUBSCRIBER_DP_NEXT_DROP,
+  SUBSCRIBER_DP_N_NEXT,
+} subscriber_dp_next_t;
+
+typedef enum
+{
+  SUBSCRIBER_DP_ERROR_MISS_DROP,
+  SUBSCRIBER_DP_N_ERROR,
+} subscriber_dp_error_t;
+
+static char *subscriber_dp_error_strings[] = {
+  [SUBSCRIBER_DP_ERROR_MISS_DROP] = "subscriber lookup miss drop",
+};
 
 static u8 *
 format_subscriber_dp_trace (u8 *s, va_list *args)
@@ -20,13 +37,13 @@ format_subscriber_dp_trace (u8 *s, va_list *args)
   CLIB_UNUSED (vlib_node_t * node) = va_arg (*args, vlib_node_t *);
   subscriber_dp_trace_t *t = va_arg (*args, subscriber_dp_trace_t *);
 
-  s = format (s, "sw_if_index %u hit %u is_ip6 %u subscriber_id %llu",
-              t->sw_if_index, t->hit, t->is_ip6,
+  s = format (s, "sw_if_index %u hit %u dropped %u is_ip6 %u subscriber_id %llu",
+              t->sw_if_index, t->hit, t->dropped, t->is_ip6,
               (unsigned long long) t->subscriber_id);
   return s;
 }
 
-static_always_inline void
+static_always_inline bool
 subscriber_dp_process_ip4 (vlib_buffer_t *b, u32 sw_if_index)
 {
   subscriber_dp_main_t *sm = &subscriber_dp_main;
@@ -42,9 +59,10 @@ subscriber_dp_process_ip4 (vlib_buffer_t *b, u32 sw_if_index)
   meta = subscriber_dp_buffer_opaque (b);
   meta->subscriber_valid = (entry != 0);
   meta->subscriber_id = entry ? entry->subscriber_id : 0;
+  return entry != 0;
 }
 
-static_always_inline void
+static_always_inline bool
 subscriber_dp_process_ip6 (vlib_buffer_t *b, u32 sw_if_index)
 {
   subscriber_dp_main_t *sm = &subscriber_dp_main;
@@ -61,12 +79,14 @@ subscriber_dp_process_ip6 (vlib_buffer_t *b, u32 sw_if_index)
   meta = subscriber_dp_buffer_opaque (b);
   meta->subscriber_valid = (entry != 0);
   meta->subscriber_id = entry ? entry->subscriber_id : 0;
+  return entry != 0;
 }
 
 static_always_inline uword
 subscriber_dp_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
                       vlib_frame_t *frame, bool is_ip6)
 {
+  subscriber_dp_main_t *sm = &subscriber_dp_main;
   vlib_buffer_t *bufs[VLIB_FRAME_SIZE], **b = bufs;
   u16 nexts[VLIB_FRAME_SIZE], *next = nexts;
   u32 *from = vlib_frame_vector_args (frame);
@@ -77,13 +97,29 @@ subscriber_dp_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
   while (n_left > 0)
     {
       u32 sw_if_index0 = vnet_buffer (b[0])->sw_if_index[VLIB_RX];
+      bool hit0;
+      bool drop0;
 
       if (is_ip6)
-        subscriber_dp_process_ip6 (b[0], sw_if_index0);
+        hit0 = subscriber_dp_process_ip6 (b[0], sw_if_index0);
       else
-        subscriber_dp_process_ip4 (b[0], sw_if_index0);
+        hit0 = subscriber_dp_process_ip4 (b[0], sw_if_index0);
 
-      vnet_feature_next_u16 (next, b[0]);
+      drop0 = !hit0;
+      if (drop0)
+        {
+          b[0]->error = node->errors[SUBSCRIBER_DP_ERROR_MISS_DROP];
+          next[0] = SUBSCRIBER_DP_NEXT_DROP;
+          sm->lookup_drops++;
+        }
+      else
+        {
+          subscriber_dp_buffer_opaque_t *meta =
+            subscriber_dp_buffer_opaque (b[0]);
+          subscriber_dp_flow_touch (vm, b[0], sw_if_index0, is_ip6,
+                                    meta->subscriber_id);
+          vnet_feature_next_u16 (next, b[0]);
+        }
 
       if (PREDICT_FALSE (b[0]->flags & VLIB_BUFFER_IS_TRACED))
         {
@@ -94,6 +130,7 @@ subscriber_dp_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
           t->sw_if_index = sw_if_index0;
           t->subscriber_id = meta->subscriber_id;
           t->hit = meta->subscriber_valid;
+          t->dropped = drop0;
           t->is_ip6 = is_ip6;
         }
 
@@ -123,6 +160,12 @@ VLIB_REGISTER_NODE (subscriber_dp_ip4_node) = {
   .vector_size = sizeof (u32),
   .type = VLIB_NODE_TYPE_INTERNAL,
   .flags = VLIB_NODE_FLAG_TRACE_SUPPORTED,
+  .n_errors = ARRAY_LEN (subscriber_dp_error_strings),
+  .error_strings = subscriber_dp_error_strings,
+  .n_next_nodes = SUBSCRIBER_DP_N_NEXT,
+  .next_nodes = {
+    [SUBSCRIBER_DP_NEXT_DROP] = "error-drop",
+  },
   .format_trace = format_subscriber_dp_trace,
 };
 
@@ -131,6 +174,12 @@ VLIB_REGISTER_NODE (subscriber_dp_ip6_node) = {
   .vector_size = sizeof (u32),
   .type = VLIB_NODE_TYPE_INTERNAL,
   .flags = VLIB_NODE_FLAG_TRACE_SUPPORTED,
+  .n_errors = ARRAY_LEN (subscriber_dp_error_strings),
+  .error_strings = subscriber_dp_error_strings,
+  .n_next_nodes = SUBSCRIBER_DP_N_NEXT,
+  .next_nodes = {
+    [SUBSCRIBER_DP_NEXT_DROP] = "error-drop",
+  },
   .format_trace = format_subscriber_dp_trace,
 };
 
