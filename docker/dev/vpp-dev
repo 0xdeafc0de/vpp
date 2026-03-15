@@ -5,8 +5,10 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 
 if docker compose version >/dev/null 2>&1; then
   compose=(docker compose -f "${repo_root}/compose.dev.yaml")
+  compose_legacy=0
 elif command -v docker-compose >/dev/null 2>&1; then
   compose=(docker-compose -f "${repo_root}/compose.dev.yaml")
+  compose_legacy=1
 else
   echo "Neither 'docker compose' nor 'docker-compose' is available." >&2
   echo "Install the Docker Compose plugin or docker-compose and try again." >&2
@@ -42,7 +44,12 @@ shift
 
 case "${cmd}" in
   up)
-    "${compose[@]}" up -d --build --force-recreate "${service}"
+    if [ "${compose_legacy}" -eq 1 ]; then
+      docker rm -f "${service}" >/dev/null 2>&1 || true
+      "${compose[@]}" up -d --build "${service}"
+    else
+      "${compose[@]}" up -d --build --force-recreate "${service}"
+    fi
     ;;
   shell)
     require_running
