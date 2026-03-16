@@ -44,6 +44,7 @@ vpp_ip_a=${vpp_ip_a_cidr%%/*}
 vpp_ip_b=${vpp_ip_b_cidr%%/*}
 client_subscriber_id=${OVS_LAB_CLIENT_SUBSCRIBER_ID:-1001}
 server_subscriber_id=${OVS_LAB_SERVER_SUBSCRIBER_ID:-2001}
+vpp_cli_script=${OVS_LAB_VPP_CLI_SCRIPT:-/tmp/ddi-vpp-plugin/tools/host-interfaces.cli}
 
 usage() {
   cat <<EOF
@@ -221,6 +222,14 @@ configure_vpp_if() {
   vppctl "set interface ip address ${vpp_if} ${addr}"
 }
 
+apply_vpp_cli_script_if_present() {
+  if "${compose[@]}" exec "${service}" bash -lc "test -f '${vpp_cli_script}'"; then
+    vppctl "exec ${vpp_cli_script}"
+    return 0
+  fi
+  return 1
+}
+
 prepare() {
   local vpp_pid
   local client_pid
@@ -256,14 +265,17 @@ prepare() {
   configure_ns_if "${client_pid}" "${client_if}" "${client_ip_cidr}" "${vpp_ip_a}"
   configure_ns_if "${server_pid}" "${server_if}" "${server_ip_cidr}" "${vpp_ip_b}"
 
-  configure_vpp_if "${vpp_if_a}" "${host_if_a}" "${vpp_ip_a_cidr}"
-  configure_vpp_if "${vpp_if_b}" "${host_if_b}" "${vpp_ip_b_cidr}"
+  if ! apply_vpp_cli_script_if_present; then
+    configure_vpp_if "${vpp_if_a}" "${host_if_a}" "${vpp_ip_a_cidr}"
+    configure_vpp_if "${vpp_if_b}" "${host_if_b}" "${vpp_ip_b_cidr}"
+  fi
 
   echo "Prepared OVS forwarding lab:"
   echo "  ${bridge_a}: ${vpp_ip_a} <-> ${client_ip}"
   echo "  ${bridge_b}: ${vpp_ip_b} <-> ${server_ip}"
   echo "  VPP interfaces: ${host_if_a}, ${host_if_b}"
   echo "  Traffic containers: ${client_container}, ${server_container}"
+  echo "  VPP CLI bootstrap: ${vpp_cli_script}"
   echo
   status
 }
